@@ -1,0 +1,292 @@
+---
+title: "PCBs in Northeast Atlantic common dolphins"
+subtitle: "Main analysis: descriptive statistics, male and female models, projections for males"
+format:
+  html:
+    toc: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+This document reproduces the parts of the paper that concern the full sample and
+the male and female models. The model for immature animals, the year-effect figures
+and the remaining tables and figures are produced by the scripts in `R/` (see the
+README). Run it from the project root; everything it writes goes to `output/`.
+
+## Setup
+
+```{r setup}
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(INLA)
+
+dir.create("output", showWarnings = FALSE)
+
+thresholds    <- c(17, 41)  # toxicity thresholds, mg/kg lipid weight
+prob_level    <- 0.8        # threshold year = first year with P(mean < threshold) >= 0.8
+n_samples     <- 2000       # posterior samples for the projections
+run_selection <- FALSE      # TRUE refits all 112 candidate models per sex (slow)
+
+sex_cols <- c("Males" = "#55A868", "Females" = "#4C72B0", "Pregnant females" = "#FDD9A2")
+```
+
+```{r data}
+pcb <- read.csv("data/PCBcorrectedDB.csv", sep = ";") |>
+  mutate(
+    Country_Code = factor(Country_Code, levels = c(4, 5), labels = c("France", "Spain")),
+    Sex          = factor(Sex, levels = 1:3,
+                          labels = c("Males", "Females", "Pregnant females")),
+    Maturity     = factor(Maturity, levels = 0:2,
+                          labels = c("Immatures", "Matures", "PregnantMatures"))
+  )
+
+males   <- pcb |> filter(Sex == "Males") |> droplevels()
+females <- pcb |> filter(Sex != "Males") |> droplevels()
+```
+
+The response in every model is `ICES73`, the Aroclor 1254-equivalent concentration
+(sum of the seven ICES indicator congeners × 3, mg/kg lipid weight).
+
+## 1. Descriptive statistics (Table 2)
+
+```{r table2}
+table2 <- pcb |>
+  mutate(Maturity = if_else(Maturity == "Immatures", "Immatures", "Matures")) |>
+  group_by(Country = Country_Code, Sex, Maturity) |>
+  summarise(
+    n              = n(),
+    n_above_17     = sum(ICES73 > 17),
+    n_above_41     = sum(ICES73 > 41),
+    sum18_mean     = mean(sum18PCB),
+    sum18_median   = median(sum18PCB),
+    ICES7_mean     = mean(ICES7),
+    ICES7_median   = median(ICES7),
+    Aroclor_mean   = mean(ICES73),
+    Aroclor_median = median(ICES73),
+    .groups = "drop"
+  ) |>
+  mutate(across(where(is.double), ~ round(.x, 2)))
+
+write.csv(table2, "output/table2_summary.csv", row.names = FALSE)
+knitr::kable(table2)
+```
+
+Percentage of each sex above the thresholds (as reported in the Results):
+
+```{r exceedance}
+pcb |>
+  group_by(Sex) |>
+  summarise(n = n(),
+            pct_above_17 = round(100 * mean(ICES73 > 17), 1),
+            pct_above_41 = round(100 * mean(ICES73 > 41), 1)) |>
+  knitr::kable()
+```
+
+## 2. Map of strandings (Figure 1)
+
+The two panels below are the base layers of Figure 1; the final layout (inset,
+mass-stranding markers) was assembled by hand. The GADM shapefiles have to be
+downloaded first (see the README).
+
+```{r map}
+countries <- do.call(rbind, lapply(c("ESP", "FRA", "GBR", "PRT"), function(iso)
+  read_sf(sprintf("data/shapefiles/gadm36_%s_0.shp", iso))))
+strandings <- st_as_sf(pcb, coords = c("Lon", "Lat"), crs = st_crs(countries))
+
+map_country <- function(country, margin = 0.3) {
+  pts <- filter(strandings, Country_Code == country)
+  bb  <- st_bbox(pts)
+  ggplot() +
+    geom_sf(data = countries, fill = "grey90", colour = "grey40", linewidth = 0.2) +
+    geom_sf(data = pts, aes(colour = Sex), size = 2.5, alpha = 0.8) +
+    scale_colour_manual(values = sex_cols, drop = FALSE) +
+    coord_sf(xlim = bb[c("xmin", "xmax")] + c(-margin, margin),
+             ylim = bb[c("ymin", "ymax")] + c(-margin, margin)) +
+    theme_bw() +
+    theme(panel.grid = element_blank())
+}
+
+for (country in levels(pcb$Country_Code)) {
+  p <- map_country(country)
+  print(p)
+  ggsave(sprintf("output/map_%s.svg", tolower(country)), p, width = 6, height = 6)
+}
+```
+
+## 3. Model selection (Supplementary Tables S2–S3)
+
+Gamma models with a log link were fitted for every combination of the candidate
+terms in four sets, which gives 112 models per sex, and compared by WAIC and LCPO
+(LCPO = −Σ log CPO). The results used in the paper are stored in
+`data/unique_models{m,f}.rds` and summarised by `R/01_model_selection_tables.R`.
+Set `run_selection <- TRUE` above to refit them; the new tables are written to
+`output/` and do not overwrite the published ones.
+
+```{r selection}
+candidate_terms <- list(
+  linear      = c("Country_Code", "Year", "Length", "Maturity"),
+  year_rw2    = c("Country_Code", "f(Year, model = 'rw2')",
+                  "f(Month, model = 'rw2', cyclic = TRUE)", "Length", "Maturity"),
+  length_rw2  = c("Country_Code", "f(Year, model = 'rw2')",
+                  "f(Month, model = 'rw2', cyclic = TRUE)", "f(Length, model = 'rw2')",
+                  "Maturity"),
+  year_iid    = c("Country_Code", "f(Year, model = 'iid')",
+                  "f(Month, model = 'rw2', cyclic = TRUE)", "f(Length, model = 'rw2')",
+                  "Maturity")
+)
+
+# every combination of a set of terms, as formula strings
+all_formulas <- function(terms) {
+  unlist(lapply(0:length(terms), function(m) {
+    if (m == 0) return("ICES73 ~ 1")
+    paste("ICES73 ~ 1 +", apply(combn(terms, m), 2, paste, collapse = " + "))
+  }))
+}
+
+fit_criteria <- function(formula, data) {
+  fit <- try(inla(as.formula(formula), family = "gamma", data = data,
+                  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                  control.inla = list(strategy = "simplified.laplace")),
+             silent = TRUE)
+  if (inherits(fit, "try-error"))
+    return(data.frame(Formula = formula, DIC = NA, WAIC = NA, LCPO = NA))
+  data.frame(Formula = formula, DIC = fit$dic$dic, WAIC = fit$waic$waic,
+             LCPO = -sum(log(fit$cpo$cpo), na.rm = TRUE))
+}
+
+select_models <- function(data) {
+  formulas <- unique(unlist(lapply(candidate_terms, all_formulas)))
+  do.call(rbind, lapply(formulas, fit_criteria, data = data)) |> arrange(WAIC)
+}
+
+if (run_selection) {
+  saveRDS(select_models(males),   "output/model_selection_males.rds")
+  saveRDS(select_models(females), "output/model_selection_females.rds")
+}
+```
+
+## 4. Final models (Table 3)
+
+Males: country, maturity and a smooth (RW2) effect of year. Females: country and
+maturity status (immature, mature non-pregnant, pregnant).
+
+```{r final-models}
+fit_males <- inla(ICES73 ~ Country_Code + Maturity + f(Year, model = "rw2"),
+                  family = "gamma", data = males,
+                  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE))
+
+fit_females <- inla(ICES73 ~ Country_Code + Maturity,
+                    family = "gamma", data = females,
+                    control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE))
+
+fixed_effects <- function(fit, model) {
+  s <- fit$summary.fixed
+  data.frame(Model = model, Parameter = rownames(s), Mean = s$mean, SD = s$sd,
+             Lower_95 = s$`0.025quant`, Upper_95 = s$`0.975quant`)
+}
+
+table3 <- rbind(fixed_effects(fit_males, "Males"),
+                fixed_effects(fit_females, "Females")) |>
+  mutate(across(Mean:Upper_95, ~ round(.x, 2)))
+
+write.csv(table3, "output/table3_males_females.csv", row.names = FALSE)
+knitr::kable(table3, row.names = FALSE)
+```
+
+## 5. Projections for males (Figure 4a, Supplementary Figures S1–S2)
+
+The male model is refitted with empty rows for 2020–2075, so INLA extrapolates the
+year effect. Joint posterior samples of the linear predictor give the distribution
+of the mean concentration in each year, country and maturity class.
+
+```{r projections}
+future <- expand.grid(Year         = 2020:2075,
+                      Country_Code = levels(males$Country_Code),
+                      Maturity     = levels(males$Maturity)) |>
+  mutate(ICES73 = NA_real_)
+
+males_aug <- bind_rows(males, future)
+pred_rows <- which(is.na(males_aug$ICES73))
+
+fit_proj <- inla(ICES73 ~ Country_Code + Maturity + f(Year, model = "rw2"),
+                 family = "gamma", data = males_aug,
+                 control.predictor = list(compute = TRUE, link = 1),
+                 control.compute   = list(config = TRUE))
+
+samples <- inla.posterior.sample(n_samples, fit_proj, seed = 1)
+eta <- sapply(samples, function(s) s$latent[paste0("Predictor:", pred_rows), 1])
+mu  <- exp(eta)   # rows = future year x country x maturity, columns = samples
+
+projection <- future |>
+  select(Year, Country_Code, Maturity) |>
+  mutate(median     = apply(mu, 1, median),
+         lower_95   = apply(mu, 1, quantile, 0.025),
+         upper_95   = apply(mu, 1, quantile, 0.975),
+         p_below_17 = rowMeans(mu < thresholds[1]),
+         p_below_41 = rowMeans(mu < thresholds[2]))
+
+write.csv(projection, "output/projection_males.csv", row.names = FALSE)
+```
+
+Year in which each group falls below each threshold:
+
+```{r threshold-years}
+first_year <- function(year, p) if (any(p >= prob_level)) min(year[p >= prob_level]) else NA
+
+threshold_years <- projection |>
+  group_by(Country_Code, Maturity) |>
+  summarise(below_17 = first_year(Year, p_below_17),
+            below_41 = first_year(Year, p_below_41),
+            .groups = "drop")
+
+write.csv(threshold_years, "output/threshold_years_males.csv", row.names = FALSE)
+knitr::kable(threshold_years)
+```
+
+```{r figure-4a}
+fig4a <- ggplot(projection, aes(Year, median, colour = Country_Code)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, fill = Country_Code),
+              alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = thresholds, linetype = "dashed", colour = "red") +
+  facet_wrap(~ Maturity) +
+  scale_y_log10() +
+  scale_colour_brewer(palette = "Dark2") +
+  scale_fill_brewer(palette = "Pastel2") +
+  labs(y = "Predicted PCB concentration (mg/kg lw)", colour = NULL, fill = NULL) +
+  theme_bw()
+
+print(fig4a)
+ggsave("output/projection_males.png", fig4a, width = 10, height = 4.2, dpi = 300)
+```
+
+```{r figures-s1-s2}
+probability_plot <- function(threshold) {
+  p_col  <- paste0("p_below_", threshold)
+  y_col  <- paste0("below_", threshold)
+  cross  <- filter(threshold_years, !is.na(.data[[y_col]]))
+  ggplot(projection, aes(Year, .data[[p_col]])) +
+    geom_line(linewidth = 0.8) +
+    geom_hline(yintercept = prob_level, linetype = "dashed") +
+    geom_vline(data = cross, aes(xintercept = .data[[y_col]]),
+               colour = "#33CC33", linetype = "dashed") +
+    geom_text(data = cross, aes(x = .data[[y_col]], y = 0.03, label = .data[[y_col]]),
+              colour = "#33CC33", angle = 90, hjust = 0, vjust = -0.4) +
+    facet_grid(Maturity ~ Country_Code) +
+    scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
+    labs(y = sprintf("P(mean < %d mg/kg lw)", threshold)) +
+    theme_bw() +
+    theme(strip.background = element_rect(fill = "grey90"),
+          strip.text = element_text(face = "bold"))
+}
+
+for (threshold in thresholds) {
+  p <- probability_plot(threshold)
+  print(p)
+  ggsave(sprintf("output/probability_below_%d_males.png", threshold), p,
+         width = 8, height = 5, dpi = 300)
+}
+```
